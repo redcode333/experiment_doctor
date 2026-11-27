@@ -116,7 +116,7 @@ def test_missing_allocation_returns_not_checked():
 
 def test_render_card_experiment_1_title_and_three_rows():
     report = evaluate_gate(EXPERIMENT_1_DETAIL, EXPERIMENT_1_RESULTS, BASE_WEIGHTS)
-    card = render_card(report)
+    card = render_card(report, "Explanation text.", "test/model:free")
     assert card.splitlines()[0] == "## Experiment Doctor verdict: DO NOT SHIP"
     table_rows = [
         line for line in card.splitlines()
@@ -293,3 +293,194 @@ def test_verdict_hash_ignores_as_of_but_tracks_check_result():
     name, _, reason = changed["checks"][0]
     changed["checks"][0] = (name, "PASS", reason)
     assert fl_mod.verdict_hash(changed) != h
+
+
+def test_check_approval_normalises_whitespace_and_checks_hash(github_config):
+    h = fl.verdict_hash(_experiment_1_report())
+    other = "0" * 64
+
+    def run(body):
+        comments = [{"body": body, "user": {"login": "maintainer"}, "created_at": "2026-11-26T15:00:00Z"}]
+
+        def fake_get(url, **kwargs):
+            if url.endswith("/comments"):
+                return FakeResponse(200, comments)
+            return FakeResponse(200, {"permission": "write"})
+
+        with patch.object(fl.requests, "get", side_effect=fake_get):
+            return fl.check_approval(h)
+
+    assert run(f"/approve\n{h}") is True
+    assert run(f"/approve {other}") is False
+
+
+# ---- OpenRouter explanation step (all HTTP mocked) ----
+
+OR_ENV_KEY = "test-openrouter-key"
+OR_MODEL = "test/model:free"
+
+
+OR_BACKUP = "test/backup:free"
+
+
+@pytest.fixture
+def openrouter_config(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", OR_ENV_KEY)
+    monkeypatch.setenv("OPENROUTER_MODEL", OR_MODEL)
+    monkeypatch.setenv("OPENROUTER_BACKUP_MODEL", OR_BACKUP)
+
+
+def _route_by_model(responses_by_model):
+    """Fake requests.post that answers from a per-model queue of responses."""
+    def fake_post(url, json, **kwargs):
+        return responses_by_model[json["model"]].pop(0)
+    return fake_post
+
+
+def _or_response(text):
+    return FakeResponse(200, {"choices": [{"message": {"content": text}}]})
+
+
+VALID_TEXT = "Experiment 1 is running. The split check failed with chi-square 27.71 and p 1.41e-07."
+INVENTED_TEXT = "Experiment 1 is running. The lift was 12.34 percent."
+
+
+def test_missing_openrouter_key_stops_with_clear_message(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_MODEL", OR_MODEL)
+    with patch.object(fl.requests, "post") as post:
+        with pytest.raises(fl.ConfigError, match="OPENROUTER_API_KEY is empty"):
+            fl.explain_with_guard(_experiment_1_report())
+    post.assert_not_called()
+
+
+def test_model_without_free_suffix_stops_with_clear_message(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", OR_ENV_KEY)
+    monkeypatch.setenv("OPENROUTER_MODEL", "vendor/paid-model")
+    with patch.object(fl.requests, "post") as post:
+        with pytest.raises(fl.ConfigError, match=":free"):
+            fl.explain_with_guard(_experiment_1_report())
+    post.assert_not_called()
+
+
+def test_invented_number_rejected_then_retry_succeeds(openrouter_config):
+    with patch.object(fl.requests, "post", side_effect=[
+        _or_response(INVENTED_TEXT),
+        _or_response(VALID_TEXT),
+    ]) as post:
+        text, model = fl.explain_with_guard(_experiment_1_report())
+    assert post.call_count == 2
+    assert text == VALID_TEXT
+    assert model == OR_MODEL
+
+
+def test_two_failures_stop_before_posting(openrouter_config):
+    report = _experiment_1_report()
+    queues = {
+        OR_MODEL: [_or_response(INVENTED_TEXT), _or_response(INVENTED_TEXT)],
+        OR_BACKUP: [_or_response(INVENTED_TEXT), _or_response(INVENTED_TEXT)],
+    }
+    with patch.object(fl.requests, "post", side_effect=_route_by_model(queues)), \
+         patch.object(fl, "post_card") as post_card:
+        with pytest.raises(fl.ExplanationUnavailable) as excinfo:
+            fl.explain_with_guard(report)
+        message = str(excinfo.value)
+        assert f"{OR_MODEL}: attempt 1 rejected" in message
+        assert f"{OR_BACKUP}: attempt 1 rejected" in message
+        assert message.count("attempt 2 rejected") == 2
+        # The card cannot be rendered without an explanation, so nothing is posted.
+        with pytest.raises(fl.ExplanationUnavailable):
+            fl.render_card(report)
+    post_card.assert_not_called()
+
+
+def test_valid_explanation_appears_in_card_with_model_name(openrouter_config):
+    report = _experiment_1_report()
+    with patch.object(fl.requests, "post", return_value=_or_response(VALID_TEXT)):
+        text, model = fl.explain_with_guard(report)
+    card = fl.render_card(report, text, model)
+    assert "### Explanation" in card
+    assert VALID_TEXT in card
+    assert f"_Model used: {OR_MODEL}_" in card
+
+
+def test_number_guard_exempts_100_and_50_only():
+    report = _experiment_1_report()
+    assert fl.number_guard("Rollout is 100 percent at 50 percent.", report) == (True, None)
+    assert fl.number_guard("Lift was 12.34.", report) == (False, "12.34")
+
+
+def test_prompt_includes_copy_exactly_instruction(openrouter_config):
+    with patch.object(fl.requests, "post", return_value=_or_response(VALID_TEXT)) as post:
+        fl.explain_llm(_experiment_1_report())
+    messages = post.call_args.kwargs["json"]["messages"]
+    system = next(m["content"] for m in messages if m["role"] == "system")
+    assert "Copy every number exactly as it appears in the facts" in system
+    assert "no rounding" in system
+    assert "no thousands separators" in system
+    assert "no converting between percentages and decimals" in system
+
+
+def test_card_shows_conversion_rates_rounded_to_three_decimals():
+    import re as _re
+
+    report = _experiment_1_report()
+    card = fl.render_card(report, "Explanation text.", "test/model:free")
+    assert "9.994%" in card
+    assert "8.888%" in card
+    # Every percentage in the card has at most 3 decimal places.
+    for value in _re.findall(r"\d+\.(\d+)%", card):
+        assert len(value) <= 3, value
+
+
+def test_primary_succeeds_backup_not_called(openrouter_config):
+    queues = {OR_MODEL: [_or_response(VALID_TEXT)], OR_BACKUP: []}
+    with patch.object(fl.requests, "post", side_effect=_route_by_model(queues)) as post:
+        text, model = fl.explain_with_guard(_experiment_1_report())
+    assert model == OR_MODEL
+    assert post.call_count == 1
+    assert all(c.kwargs["json"]["model"] == OR_MODEL for c in post.call_args_list)
+
+
+def test_primary_fails_backup_succeeds_card_shows_backup(openrouter_config):
+    report = _experiment_1_report()
+    queues = {
+        OR_MODEL: [_or_response(INVENTED_TEXT), _or_response(INVENTED_TEXT)],
+        OR_BACKUP: [_or_response(VALID_TEXT)],
+    }
+    with patch.object(fl.requests, "post", side_effect=_route_by_model(queues)):
+        text, model = fl.explain_with_guard(report)
+    assert model == OR_BACKUP
+    card = fl.render_card(report, text, model)
+    assert f"_Model used: {OR_BACKUP}_" in card
+    assert f"_Model used: {OR_MODEL}_" not in card
+
+
+def test_backup_model_empty_stops_with_clear_message(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", OR_ENV_KEY)
+    monkeypatch.setenv("OPENROUTER_MODEL", OR_MODEL)
+    monkeypatch.setenv("OPENROUTER_BACKUP_MODEL", "")
+    with patch.object(fl.requests, "post") as post:
+        with pytest.raises(fl.ConfigError, match="OPENROUTER_BACKUP_MODEL is empty"):
+            fl.explain_with_guard(_experiment_1_report())
+    post.assert_not_called()
+
+
+def test_backup_model_without_free_stops_with_clear_message(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", OR_ENV_KEY)
+    monkeypatch.setenv("OPENROUTER_MODEL", OR_MODEL)
+    monkeypatch.setenv("OPENROUTER_BACKUP_MODEL", "vendor/paid-backup")
+    with patch.object(fl.requests, "post") as post:
+        with pytest.raises(fl.ConfigError, match="OPENROUTER_BACKUP_MODEL must end in ':free'"):
+            fl.explain_with_guard(_experiment_1_report())
+    post.assert_not_called()
+
+
+def test_backup_equal_to_primary_stops_with_clear_message(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", OR_ENV_KEY)
+    monkeypatch.setenv("OPENROUTER_MODEL", OR_MODEL)
+    monkeypatch.setenv("OPENROUTER_BACKUP_MODEL", OR_MODEL)
+    with patch.object(fl.requests, "post") as post:
+        with pytest.raises(fl.ConfigError, match="equals OPENROUTER_MODEL"):
+            fl.explain_with_guard(_experiment_1_report())
+    post.assert_not_called()

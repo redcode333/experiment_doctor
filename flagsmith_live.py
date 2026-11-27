@@ -6,11 +6,13 @@ Config is read from .env (never hardcoded). Requires python-dotenv and requests.
 import hashlib
 import json
 import os
+import re
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+# .env is the config source; override=True so it wins over any stale OS-level variable.
+load_dotenv(override=True)
 
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -379,7 +381,8 @@ def check_approval(approval_hash: str) -> bool:
     expected = f"/approve {approval_hash}"
     comments = sorted(resp.json(), key=lambda c: c["created_at"], reverse=True)
     for comment in comments:
-        if comment["body"] != expected:
+        # Collapse all whitespace runs (including newlines) to one space, then trim.
+        if " ".join(comment["body"].split()) != expected:
             continue
         if _has_write_access(comment["user"]["login"]):
             return True
@@ -422,7 +425,7 @@ def approve_and_pause(posted_hash: str, experiment_id=None) -> str:
         return "PAUSED"
     _create_issue(
         PAUSE_FALLBACK_TITLE,
-        render_card(report) + f"\n\n**set_flag error:**\n\n```\n{error}\n```\n",
+        _render_card_body(report) + f"\n\n**set_flag error:**\n\n```\n{error}\n```\n",
     )
     return f"PAUSE FAILED: fallback issue opened ({error})"
 
@@ -431,8 +434,134 @@ def _md_cell(text) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ")
 
 
-def render_card(gate_result: dict) -> str:
-    """Render a gate result (from evaluate_gate / run_gate) as a Markdown verdict card."""
+class ConfigError(RuntimeError):
+    """A required setting is missing or invalid. The explanation step cannot run."""
+
+
+class ExplanationUnavailable(RuntimeError):
+    """No valid LLM explanation could be produced. The card must not be posted."""
+
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+EXPLANATION_SYSTEM_PROMPT = (
+    "You explain an A/B experiment verdict using only the JSON facts the user provides. "
+    "Do not add any number that does not appear in the facts. "
+    "Copy every number exactly as it appears in the facts: no rounding, no thousands separators, "
+    "and no converting between percentages and decimals. "
+    "Do not recommend changing the verdict, the flag, or the experiment. "
+    "Answer in four sentences or fewer."
+)
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+_EXEMPT_NUMBERS = {100.0, 50.0}
+
+
+def _openrouter_config():
+    """Validate all OpenRouter settings. Returns (key, primary_model, backup_model)."""
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        raise ConfigError("OPENROUTER_API_KEY is empty in .env; explanation step cannot run")
+    primary = os.environ.get("OPENROUTER_MODEL", "").strip()
+    if not primary.endswith(":free"):
+        raise ConfigError(
+            f"OPENROUTER_MODEL must end in ':free' (got {primary!r}); explanation step cannot run"
+        )
+    backup = os.environ.get("OPENROUTER_BACKUP_MODEL", "").strip()
+    if not backup:
+        raise ConfigError("OPENROUTER_BACKUP_MODEL is empty in .env; explanation step cannot run")
+    if not backup.endswith(":free"):
+        raise ConfigError(
+            f"OPENROUTER_BACKUP_MODEL must end in ':free' (got {backup!r}); explanation step cannot run"
+        )
+    if backup == primary:
+        raise ConfigError(
+            "OPENROUTER_BACKUP_MODEL equals OPENROUTER_MODEL; choose a different backup model"
+        )
+    return key, primary, backup
+
+
+def _facts(gate_result: dict) -> dict:
+    """The gate result plus per-variant conversion rates in percent (3 dp): the only facts allowed."""
+    facts = dict(gate_result)
+    facts["conversion_rate_percent"] = {
+        name: (round(rate * 100, 3) if rate is not None else None)
+        for name, rate in gate_result["conversion_rate"].items()
+    }
+    return facts
+
+
+def explain_llm(gate_result: dict, model=None):
+    """Ask a free OpenRouter model to explain the gate facts. Returns (text, model). Timeout 30s.
+
+    model defaults to OPENROUTER_MODEL; pass the backup model name to use the backup.
+    """
+    key, primary, _ = _openrouter_config()
+    model = model or primary
+    resp = requests.post(
+        OPENROUTER_URL,
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": EXPLANATION_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(_facts(gate_result), sort_keys=True, default=str)},
+            ],
+        },
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    text = resp.json()["choices"][0]["message"]["content"].strip()
+    return text, model
+
+
+def number_guard(text: str, gate_result: dict):
+    """(True, None) if every number in text appears in the facts (100 and 50 exempt).
+    Otherwise (False, offending_number_text)."""
+    facts_text = json.dumps(_facts(gate_result), sort_keys=True, default=str)
+    allowed = {float(n) for n in _NUMBER_RE.findall(facts_text)} | _EXEMPT_NUMBERS
+    for token in _NUMBER_RE.findall(text):
+        if float(token) not in allowed:
+            return False, token
+    return True, None
+
+
+def explain_with_guard(gate_result: dict):
+    """Explanation from the primary model, then the backup model. Returns (text, model_used).
+
+    Each model gets two attempts (one retry) on request failure or number_guard rejection.
+    ConfigError propagates before any request is made. If both models fail, raises
+    ExplanationUnavailable with the reasons for each model.
+    """
+    _, primary, backup = _openrouter_config()
+    reasons_by_model = {}
+    for model in (primary, backup):
+        model_reasons = []
+        for attempt in (1, 2):
+            try:
+                text, used = explain_llm(gate_result, model)
+            except ConfigError:
+                raise
+            except Exception as exc:  # network, HTTP status, or response-shape errors
+                model_reasons.append(f"attempt {attempt} request failed: {type(exc).__name__}: {exc}")
+                continue
+            ok, offending = number_guard(text, gate_result)
+            if ok:
+                return text, used
+            model_reasons.append(f"attempt {attempt} rejected: number {offending} is not in the gate facts")
+        reasons_by_model[model] = model_reasons
+    raise ExplanationUnavailable(
+        "; ".join(f"{m}: {' / '.join(r)}" for m, r in reasons_by_model.items())
+    )
+
+
+def render_card(gate_result: dict, explanation=None, model=None) -> str:
+    """Render the verdict card. Blocked unless an explanation and its model name are supplied."""
+    if not explanation or not model:
+        raise ExplanationUnavailable("no explanation supplied, so the card was not rendered")
+    return _render_card_body(gate_result, explanation, model)
+
+
+def _render_card_body(gate_result: dict, explanation=None, model=None) -> str:
+    """Render the card body. The Explanation section appears only when an explanation is given."""
     lines = [
         f"## Experiment Doctor verdict: {gate_result['gate']}",
         "",
@@ -447,9 +576,11 @@ def render_card(gate_result: dict) -> str:
     for name, result, reason in gate_result["checks"]:
         lines.append(f"| {_md_cell(name)} | {_md_cell(result)} | {_md_cell(reason or '')} |")
     lines += ["", "**Conversion rate per variant**", ""]
-    for name, rate in gate_result["conversion_rate"].items():
-        value = f"{rate:.3%}" if rate is not None else "n/a"
+    for name, pct in _facts(gate_result)["conversion_rate_percent"].items():
+        value = f"{pct:.3f}%" if pct is not None else "n/a"
         lines.append(f"- {_md_cell(name)}: {value}")
+    if explanation is not None:
+        lines += ["", "### Explanation", "", explanation, "", f"_Model used: {model}_"]
     lines += [
         "",
         f"To pause checkout_button, comment /approve {verdict_hash(gate_result)} on this issue. Nothing changes until then.",
@@ -515,7 +646,15 @@ if __name__ == "__main__":
     # Read-only: runs the gate for experiment 1, prints the card, and writes it to a file.
     # Does not call set_flag or any PATCH.
     report = run_gate(1)
-    card = render_card(report)
+    try:
+        explanation, model = explain_with_guard(report)
+    except ConfigError as exc:
+        print(f"config error: {exc}")
+        raise SystemExit(1)
+    except ExplanationUnavailable as exc:
+        print(f"explanation unavailable: {exc}")
+        raise SystemExit(1)
+    card = render_card(report, explanation, model)
     print()
     print(card)
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verdict_experiment_1.md")
