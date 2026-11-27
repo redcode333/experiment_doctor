@@ -1,1 +1,4 @@
 .env
+agent_state.json
+agent_state.json.tmp
+seen.jsonl

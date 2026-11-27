@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
@@ -14,18 +15,33 @@ from dotenv import load_dotenv
 # .env is the config source; override=True so it wins over any stale OS-level variable.
 load_dotenv(override=True)
 
+class ConfigError(RuntimeError):
+    """A required setting is missing or invalid. The step that needs it cannot run."""
+
+
+def pause_fallback_title() -> str:
+    """Title of the issue opened when a pause fails. Built from the configured flag name."""
+    return f"Pause {FLAGSMITH_FLAG}: manual action needed"
+
+
+def _required(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ConfigError(f"{name} is not set in .env; set it before running")
+    return value
+
+
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_ISSUE_NUMBER = os.environ.get("GITHUB_ISSUE_NUMBER", "")
-FLAGSMITH_EXPERIMENT_ID = os.environ.get("FLAGSMITH_EXPERIMENT_ID", "")
-PAUSE_FALLBACK_TITLE = "Pause checkout_button: manual action needed"
 
-FLAGSMITH_URL = os.environ["FLAGSMITH_URL"].rstrip("/")
-FLAGSMITH_TOKEN = os.environ["FLAGSMITH_TOKEN"]
-FLAGSMITH_PROJECT_ID = os.environ["FLAGSMITH_PROJECT_ID"]
-FLAGSMITH_ENVIRONMENT_ID = int(os.environ["FLAGSMITH_ENVIRONMENT_ID"])
-FLAGSMITH_FLAG = os.environ["FLAGSMITH_FLAG"]
+FLAGSMITH_URL = _required("FLAGSMITH_URL").rstrip("/")
+FLAGSMITH_TOKEN = _required("FLAGSMITH_TOKEN")
+FLAGSMITH_PROJECT_ID = _required("FLAGSMITH_PROJECT_ID")
+FLAGSMITH_ENVIRONMENT_ID = int(_required("FLAGSMITH_ENVIRONMENT_ID"))
+FLAGSMITH_FLAG = _required("FLAGSMITH_FLAG")
+FLAGSMITH_CONTROL_VARIANT = os.environ.get("FLAGSMITH_CONTROL_VARIANT", "").strip() or "control"
 
 HEADERS = {"Authorization": f"Api-Key {FLAGSMITH_TOKEN}"}
 TIMEOUT = 15
@@ -217,8 +233,70 @@ def get_base_weights(feature_id: int) -> dict:
     }
 
 
-def evaluate_gate(detail: dict, results: dict, base_weights: dict):
-    """Pure gate logic. detail = experiment detail JSON, results = results endpoint JSON."""
+SEEN_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen.jsonl")
+
+
+def _parse_ts(value: str) -> datetime:
+    """ISO timestamp to an aware datetime. Accepts a trailing 'Z'."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def load_seen_records(path: str = SEEN_LOG_PATH):
+    """Records from seen.jsonl as dicts {variant, ts (datetime)}, or None if missing or empty."""
+    if not os.path.exists(path):
+        return None
+    records = []
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            if raw.strip():
+                row = json.loads(raw)
+                records.append({"variant": row["variant"], "ts": _parse_ts(row["ts"])})
+    return records or None
+
+
+def check_seen(counted: dict, records, started_at):
+    """Seen check: every counted user needs a matching seen record, inside the experiment window.
+
+    counted: experiment variant name -> counted users, e.g. {<control>: 1924, <treatment>: 1611}.
+    records: seen records from load_seen_records (dicts with variant and ts).
+    started_at: datetime the experiment started, or None if unknown.
+    Roles: FLAGSMITH_CONTROL_VARIANT matches the control variant; every other seen value is the treatment.
+
+    NOT_CHECKED if there are no records, the start time is unknown, or the log starts after
+    the experiment started (the log does not cover the window). FAIL only when the log covers
+    the window and seen counts inside it are below the counted users. Otherwise PASS.
+    Returns (PASS | FAIL | NOT_CHECKED, reason).
+    """
+    if not records:
+        return NOT_CHECKED, "seen.jsonl missing or empty"
+    if started_at is None:
+        return NOT_CHECKED, "experiment start time unknown"
+    if min(r["ts"] for r in records) > started_at:
+        return NOT_CHECKED, "seen log starts after the experiment started"
+    control = FLAGSMITH_CONTROL_VARIANT
+    treatments = [name for name in counted if name != control]
+    if len(treatments) != 1:
+        return NOT_CHECKED, f"cannot map variants to seen values: {sorted(counted)}"
+    in_window = [r for r in records if r["ts"] >= started_at]
+    seen_control = sum(1 for r in in_window if r["variant"] == control)
+    seen_treatment = sum(1 for r in in_window if r["variant"] != control)
+    lows, details = [], []
+    for name, n in counted.items():
+        seen_n = seen_control if name == control else seen_treatment
+        details.append(f"{name}: seen {seen_n}, counted {n}")
+        if seen_n < n:
+            lows.append(f"{name}: seen {seen_n} < counted {n}")
+    if lows:
+        return "FAIL", "; ".join(lows)
+    return PASS, "; ".join(details)
+
+
+def evaluate_gate(detail: dict, results: dict, base_weights: dict, seen_records=None):
+    """Pure gate logic. detail = experiment detail JSON, results = results endpoint JSON.
+
+    seen_records: records from load_seen_records (None means the seen log is missing or empty).
+    The experiment start time comes from detail["started_at"].
+    """
     from scipy.stats import chisquare
 
     r = results["results"]
@@ -236,10 +314,10 @@ def evaluate_gate(detail: dict, results: dict, base_weights: dict):
     for name, v in variants.items():
         labels.append(name)
         observed.append(v["n"])
-        if name == "control":
+        if name == FLAGSMITH_CONTROL_VARIANT:
             expected_share.append((100.0 - listed_total) / 100.0)
         else:
-            # Only one non-control allocation is listed (option 2 = V_2 for this flag).
+            # Only one non-control allocation is supported: the single listed rollout entry.
             if len(planned_pct) != 1:
                 raise ValueError("expected exactly one listed non-control allocation")
             expected_share.append(next(iter(planned_pct.values())) / 100.0)
@@ -251,7 +329,10 @@ def evaluate_gate(detail: dict, results: dict, base_weights: dict):
 
     rollout_result, rollout_reason = check_rollout_vs_base(rollout, base_weights)
 
-    seen_result, seen_reason = NOT_CHECKED, "no seen log on this instance"
+    counted = {name: v["n"] for name, v in variants.items()}
+    started = detail.get("started_at")
+    started_at = _parse_ts(started) if started else None
+    seen_result, seen_reason = check_seen(counted, seen_records, started_at)
 
     checks = [
         ("split (chi-square)", srm_result, srm_reason),
@@ -293,7 +374,7 @@ def current_gate(experiment_id: int) -> dict:
         headers=HEADERS, timeout=TIMEOUT,
     ).json()
     base_weights = get_base_weights(detail["feature"]["id"])
-    return evaluate_gate(detail, results, base_weights)
+    return evaluate_gate(detail, results, base_weights, load_seen_records(SEEN_LOG_PATH))
 
 
 def run_gate(experiment_id: int):
@@ -400,18 +481,17 @@ def _create_issue(title: str, body: str) -> int:
     return resp.json()["number"]
 
 
-def approve_and_pause(posted_hash: str, experiment_id=None) -> str:
-    """Pause checkout_button only if the verdict is unchanged and an authorised approval exists.
+def approve_and_pause(posted_hash: str, experiment_id) -> str:
+    """Pause FLAGSMITH_FLAG only if the verdict is unchanged and an authorised approval exists.
 
     Returns a short status string: 'PAUSED', 'REFUSED: ...', or 'PAUSE FAILED: ...'.
     """
-    exp_id = int(experiment_id if experiment_id is not None else FLAGSMITH_EXPERIMENT_ID)
-    report = current_gate(exp_id)
+    report = current_gate(int(experiment_id))
     new_hash = verdict_hash(report)
     if new_hash != posted_hash:
         _post_comment(
             f"Verdict changed since it was posted (new hash {new_hash}). "
-            "Refusing to pause checkout_button. Re-run the gate and post a new card."
+            f"Refusing to pause {FLAGSMITH_FLAG}. Re-run the gate and post a new card."
         )
         return "REFUSED: verdict changed"
     if not check_approval(posted_hash):
@@ -424,7 +504,7 @@ def approve_and_pause(posted_hash: str, experiment_id=None) -> str:
     if error is None:
         return "PAUSED"
     _create_issue(
-        PAUSE_FALLBACK_TITLE,
+        pause_fallback_title(),
         _render_card_body(report) + f"\n\n**set_flag error:**\n\n```\n{error}\n```\n",
     )
     return f"PAUSE FAILED: fallback issue opened ({error})"
@@ -432,10 +512,6 @@ def approve_and_pause(posted_hash: str, experiment_id=None) -> str:
 
 def _md_cell(text) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ")
-
-
-class ConfigError(RuntimeError):
-    """A required setting is missing or invalid. The explanation step cannot run."""
 
 
 class ExplanationUnavailable(RuntimeError):
@@ -583,7 +659,7 @@ def _render_card_body(gate_result: dict, explanation=None, model=None) -> str:
         lines += ["", "### Explanation", "", explanation, "", f"_Model used: {model}_"]
     lines += [
         "",
-        f"To pause checkout_button, comment /approve {verdict_hash(gate_result)} on this issue. Nothing changes until then.",
+        f"To pause {FLAGSMITH_FLAG}, comment /approve {verdict_hash(gate_result)} on this issue. Nothing changes until then.",
         "",
     ]
     return "\n".join(lines)
@@ -643,9 +719,15 @@ def print_results_shape(experiment_id: int, max_depth: int = 3):
 
 
 if __name__ == "__main__":
-    # Read-only: runs the gate for experiment 1, prints the card, and writes it to a file.
-    # Does not call set_flag or any PATCH.
-    report = run_gate(1)
+    # Read-only: python flagsmith_live.py <experiment_id>
+    # Runs the gate, generates the explanation, prints the card, and writes it to a file.
+    # Does not post to GitHub and does not call set_flag or any PATCH.
+    import sys
+
+    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
+        raise SystemExit("usage: python flagsmith_live.py <experiment_id>")
+    experiment_id = int(sys.argv[1])
+    report = run_gate(experiment_id)
     try:
         explanation, model = explain_with_guard(report)
     except ConfigError as exc:
@@ -657,7 +739,7 @@ if __name__ == "__main__":
     card = render_card(report, explanation, model)
     print()
     print(card)
-    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verdict_experiment_1.md")
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"verdict_{experiment_id}.md")
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(card)
     print("written:", out_path)

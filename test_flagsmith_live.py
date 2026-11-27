@@ -11,6 +11,7 @@ from flagsmith_live import (
 EXPERIMENT_1_DETAIL = {
     "id": 1,
     "status": "running",
+    "started_at": "2026-11-26T13:37:46.183364Z",
     "feature": {"id": 1, "name": "checkout_button"},
     "experiment_rollout": {
         "enabled": True,
@@ -155,7 +156,6 @@ def github_config(monkeypatch):
     monkeypatch.setattr(fl, "GITHUB_TOKEN", "test-github-token")
     monkeypatch.setattr(fl, "GITHUB_REPO", "owner/repo")
     monkeypatch.setattr(fl, "GITHUB_ISSUE_NUMBER", "7")
-    monkeypatch.setattr(fl, "FLAGSMITH_EXPERIMENT_ID", "1")
 
 
 def _experiment_1_report():
@@ -219,7 +219,7 @@ def test_approval_refused_when_verdict_hash_changed(github_config):
          patch.object(fl, "set_flag") as set_flag, \
          patch.object(fl, "_post_comment") as post_comment, \
          patch.object(fl, "check_approval") as check:
-        result = fl.approve_and_pause(posted_hash)
+        result = fl.approve_and_pause(posted_hash, 1)
 
     assert result == "REFUSED: verdict changed"
     set_flag.assert_not_called()
@@ -246,7 +246,7 @@ def test_approval_accepted_calls_set_flag_once_with_false(github_config):
          patch.object(fl.requests, "get", side_effect=fake_get), \
          patch.object(fl, "set_flag", return_value=(200, {"enabled": False})) as set_flag, \
          patch.object(fl, "_create_issue") as create_issue:
-        result = fl.approve_and_pause(h)
+        result = fl.approve_and_pause(h, 1)
 
     assert result == "PAUSED"
     set_flag.assert_called_once_with(False)
@@ -269,12 +269,12 @@ def test_set_flag_failure_opens_fallback_issue(github_config):
          patch.object(fl.requests, "get", side_effect=fake_get), \
          patch.object(fl, "set_flag", return_value=(500, "boom")), \
          patch.object(fl, "_create_issue") as create_issue:
-        result = fl.approve_and_pause(h)
+        result = fl.approve_and_pause(h, 1)
 
     assert result.startswith("PAUSE FAILED")
     create_issue.assert_called_once()
     title, body = create_issue.call_args.args
-    assert title == "Pause checkout_button: manual action needed"
+    assert title == f"Pause {fl.FLAGSMITH_FLAG}: manual action needed"
     assert "Experiment Doctor verdict: DO NOT SHIP" in body
     assert "HTTP 500: boom" in body
 
@@ -484,3 +484,89 @@ def test_backup_equal_to_primary_stops_with_clear_message(monkeypatch):
         with pytest.raises(fl.ConfigError, match="equals OPENROUTER_MODEL"):
             fl.explain_with_guard(_experiment_1_report())
     post.assert_not_called()
+
+
+
+# ---- seen check (time window) ----
+from datetime import datetime as _dt  # noqa: E402
+
+START = _dt.fromisoformat("2026-11-26T13:37:46.183364+00:00")
+
+
+def _rec(variant, ts):
+    return {"variant": variant, "ts": _dt.fromisoformat(ts)}
+
+
+def _window_records(control, treatment, ts="2026-11-26T14:00:00+00:00"):
+    return [_rec("control", ts) for _ in range(control)] + [
+        _rec("new_checkout", ts) for _ in range(treatment)
+    ]
+
+
+COUNTED = {"control": 10, "V_2": 8}
+
+
+def test_seen_pass_when_every_counted_user_is_seen_in_window():
+    # A record from before the start means the log covers the window.
+    records = [_rec("control", "2026-11-26T13:00:00+00:00")] + _window_records(12, 9)
+    result, reason = fl.check_seen(COUNTED, records, START)
+    assert result == PASS
+    assert reason == "control: seen 12, counted 10; V_2: seen 9, counted 8"
+
+
+def test_seen_fail_when_log_covers_window_and_counts_are_low():
+    # The log starts before the experiment, so it covers the window.
+    records = [_rec("control", "2026-11-26T13:00:00+00:00")] + _window_records(5, 9)
+    result, reason = fl.check_seen(COUNTED, records, START)
+    assert result == "FAIL"
+    assert reason == "control: seen 5 < counted 10"
+
+
+def test_seen_not_checked_when_log_starts_after_experiment_started():
+    # Even with plenty of records, a log that starts after the start time does not cover the window.
+    result, reason = fl.check_seen(COUNTED, _window_records(100, 100), START)
+    assert result == NOT_CHECKED
+    assert reason == "seen log starts after the experiment started"
+
+
+def test_seen_not_checked_when_missing_or_empty():
+    assert fl.check_seen(COUNTED, None, START) == (NOT_CHECKED, "seen.jsonl missing or empty")
+    assert fl.check_seen(COUNTED, [], START) == (NOT_CHECKED, "seen.jsonl missing or empty")
+
+
+def test_seen_not_checked_when_start_time_unknown():
+    assert fl.check_seen(COUNTED, _window_records(1, 1), None) == (
+        NOT_CHECKED, "experiment start time unknown")
+
+
+def test_load_seen_records_missing_empty_and_populated(tmp_path):
+    assert fl.load_seen_records(str(tmp_path / "none.jsonl")) is None
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert fl.load_seen_records(str(empty)) is None
+    full = tmp_path / "seen.jsonl"
+    full.write_text(
+        '{"user_id": "a", "variant": "control", "ts": "2026-11-26T14:00:00Z"}\n'
+        '{"user_id": "b", "variant": "new_checkout", "ts": "2026-11-26T14:05:00.5+00:00"}\n',
+        encoding="utf-8",
+    )
+    records = fl.load_seen_records(str(full))
+    assert [r["variant"] for r in records] == ["control", "new_checkout"]
+    assert all(isinstance(r["ts"], _dt) for r in records)
+
+
+def test_gate_experiment_1_seen_not_checked_when_log_starts_after_start():
+    report = fl.evaluate_gate(EXPERIMENT_1_DETAIL, EXPERIMENT_1_RESULTS, BASE_WEIGHTS,
+                              _window_records(5, 5))
+    checks = {name: (res, reason) for name, res, reason in report["checks"]}
+    assert checks["seen"] == (NOT_CHECKED, "seen log starts after the experiment started")
+    # The split check still fails on experiment 1, so the gate stays DO NOT SHIP.
+    assert report["gate"] == DO_NOT_SHIP
+
+
+def test_gate_seen_fail_when_log_covers_window_is_do_not_ship():
+    records = [_rec("control", "2026-11-26T13:00:00+00:00")] + _window_records(1, 1)
+    report = fl.evaluate_gate(EXPERIMENT_1_DETAIL, EXPERIMENT_1_RESULTS, BASE_WEIGHTS, records)
+    checks = {name: res for name, res, _ in report["checks"]}
+    assert checks["seen"] == "FAIL"
+    assert report["gate"] == DO_NOT_SHIP
